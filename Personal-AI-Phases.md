@@ -572,9 +572,9 @@ Phase 1 — Core AI
 [x] 1.1 Chat loop
 
 Phase 2 — Memory System
-[ ] 2.1 Memory extraction
-[ ] 2.2 Memory Inbox
-[ ] 2.3 Memory Timeline
+[x] 2.1 Memory extraction
+[x] 2.2 Memory Inbox
+[x] 2.3 Memory Timeline
 [ ] 2.4 Conflict flagging
 [ ] Phase 2 exit: full cross-session recall loop
 

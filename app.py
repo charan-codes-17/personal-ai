@@ -1,21 +1,27 @@
 """Personal AI - Streamlit Application.
 
-Phase 1.3: Memory Inbox.
-Sidebar section listing all pending MemoryRecords extracted from past turns.
-Each record has Approve (sets approval_status='approved') and Ignore (sets
-approval_status='rejected') buttons. Status changes only happen through these
-explicit user actions. 'Ignore' sets rejected rather than deleting, preserving
-the full audit trail in storage.
+Subphase 2.3 — Memory Timeline (BL-06):
+  A new 'Memory Timeline' tab lists all approval_status='approved' records,
+  most recent first. Each record has inline Edit and Delete controls.
+  Edit updates content in storage via _store.update(); Delete calls
+  _store.delete() — a hard removal from the DB, not a UI hide.
 
-Phase 1.2: Memory Extraction.
-After each user turn, prompts Nemotron Nano/Super to extract any
-memory-worthy fact/preference/decision and stores it as a pending
-MemoryRecord via the Phase 0 storage module.
+Subphase 2.2 — Memory Inbox / Staged Approval (BL-05):
+  Sidebar section listing all pending MemoryRecords extracted from past turns.
+  Each record has Approve (sets approval_status='approved') and Ignore (sets
+  approval_status='rejected') buttons. Status changes only happen through
+  explicit user actions. 'Ignore' sets rejected rather than deleting,
+  preserving the full audit trail in storage.
 
-Phase 1.1: Core AI Chat Loop.
-Maintains session state conversation turns {role, content, timestamp},
-formats running context, and invokes Nemotron Nano/Super on Nebius Token Factory.
-Preserves Phase 0.3 connectivity diagnostics."""
+Subphase 2.1 — Memory Extraction (BL-04):
+  After each user turn, prompts Nemotron Nano/Super to extract any
+  memory-worthy fact/preference/decision and stores it as a pending
+  MemoryRecord via the Phase 0 storage module.
+
+Phase 1.1 — Core AI Chat Loop (BL-03):
+  Maintains session state conversation turns {role, content, timestamp},
+  formats running context, and invokes Nemotron Nano/Super on Nebius Token
+  Factory. Preserves Phase 0.3 connectivity diagnostics."""
 
 import logging
 import os
@@ -48,8 +54,11 @@ from chat import (
 
 logger = logging.getLogger(__name__)
 
-# Shared storage instance (default memory.db)
-_store = MemoryStorage()
+# Shared storage instance.
+# PERSONAL_AI_DB env var lets tests redirect to an isolated DB file
+# without touching the production memory.db.
+_db_path = os.environ.get("PERSONAL_AI_DB", "memory.db")
+_store = MemoryStorage(_db_path)
 
 
 def get_nebius_api_key() -> Optional[str]:
@@ -196,69 +205,239 @@ with st.sidebar:
                         st.error(f"Nano/Super-tier model failed: {e}")
 
 
-# --- Main Chat UI ---
+# ---------------------------------------------------------------------------
+# Main Area: Tabs — Chat | Memory Timeline
+# ---------------------------------------------------------------------------
 st.title("Personal AI")
 st.caption(
-    "Multi-turn conversational assistant powered by NVIDIA Nemotron Nano/Super via Nebius Token Factory. "
-    "Full conversation history is maintained as context across turns."
+    "Multi-turn conversational assistant powered by NVIDIA Nemotron Nano/Super via Nebius Token Factory."
 )
 
-# Display existing chat history
-for turn in conversation:
-    role = turn.get("role", ROLE_USER)
-    content = turn.get("content", "")
-    with st.chat_message(role):
-        st.markdown(content)
+tab_chat, tab_timeline = st.tabs(["💬 Chat", "🕐 Memory Timeline"])
 
-# Chat input bar
-prompt = st.chat_input("Type your message here...")
+# ===========================================================================
+# TAB 1 — Chat
+# ===========================================================================
+with tab_chat:
+    # Display existing chat history
+    for turn in conversation:
+        role = turn.get("role", ROLE_USER)
+        content = turn.get("content", "")
+        with st.chat_message(role):
+            st.markdown(content)
 
-if prompt:
-    api_key = get_nebius_api_key()
+    # Chat input bar
+    prompt = st.chat_input("Type your message here...")
 
-    if not api_key:
-        st.error(
-            "Nebius API key not found. Please configure `NEBIUS_API_KEY` in `.env` "
-            "or `st.secrets` to continue."
+    if prompt:
+        api_key = get_nebius_api_key()
+
+        if not api_key:
+            st.error(
+                "Nebius API key not found. Please configure `NEBIUS_API_KEY` in `.env` "
+                "or `st.secrets` to continue."
+            )
+        else:
+            # 1. Record and render user turn
+            turn = add_turn(ROLE_USER, prompt)
+            turn_id = session_id  # use session_id as the turn anchor
+            with st.chat_message(ROLE_USER):
+                st.markdown(prompt)
+
+            # 2. Render thinking indicator and invoke model
+            with st.chat_message(ROLE_ASSISTANT):
+                with st.spinner("Nemotron is thinking..."):
+                    try:
+                        response = call_chat_turn(api_key=api_key)
+                        assistant_content = response["content"]
+                        # 3. Record assistant turn in session history
+                        add_turn(ROLE_ASSISTANT, assistant_content)
+                        st.markdown(assistant_content)
+                    except NebiusAPIError as e:
+                        st.error(f"**Nebius API Error ({e.status_code or 'Failure'}):** {e}")
+                    except Exception as e:
+                        st.error(f"**Error invoking Nemotron Nano/Super:** {str(e)}")
+
+            # 4. Memory extraction: run silently after each user turn.
+            #    Failures are intentionally swallowed -- this step must never
+            #    disrupt the chat experience.
+            try:
+                mem_record = extract_and_store_pending(
+                    user_message=prompt,
+                    source_turn_id=turn_id,
+                    api_key=api_key,
+                    storage=_store,
+                )
+                if mem_record:
+                    logger.info(
+                        "[MemoryExtraction] Stored pending record %s for session %s",
+                        mem_record.id,
+                        session_id,
+                    )
+            except Exception as _mem_exc:  # noqa: BLE001
+                logger.warning(
+                    "[MemoryExtraction] Extraction step failed (non-fatal): %s", _mem_exc
+                )
+
+# ===========================================================================
+# TAB 2 — Memory Timeline (Subphase 2.3 / BL-06 / FR-003)
+# ===========================================================================
+with tab_timeline:
+    st.subheader("🕐 Memory Timeline")
+    st.caption(
+        "All approved memories, most recent first. "
+        "Use **Edit** to correct a record's content (persists to storage). "
+        "Use **Delete** to permanently remove it from storage — not just from this view."
+    )
+
+    # Fetch approved records, most recent first
+    approved_records = list(
+        reversed(_store.list(approval_status=ApprovalStatus.APPROVED))
+    )
+
+    if not approved_records:
+        st.info(
+            "No approved memories yet. Chat with the assistant, then approve "
+            "candidates from the **Memory Inbox** in the sidebar."
         )
     else:
-        # 1. Record and render user turn
-        turn = add_turn(ROLE_USER, prompt)
-        turn_id = session_id  # use session_id as the turn anchor
-        with st.chat_message(ROLE_USER):
-            st.markdown(prompt)
+        st.caption(f"**{len(approved_records)} approved record(s)**")
 
-        # 2. Render thinking indicator and invoke model
-        with st.chat_message(ROLE_ASSISTANT):
-            with st.spinner("Nemotron is thinking..."):
-                try:
-                    response = call_chat_turn(api_key=api_key)
-                    assistant_content = response["content"]
-                    # 3. Record assistant turn in session history
-                    add_turn(ROLE_ASSISTANT, assistant_content)
-                    st.markdown(assistant_content)
-                except NebiusAPIError as e:
-                    st.error(f"**Nebius API Error ({e.status_code or 'Failure'}):** {e}")
-                except Exception as e:
-                    st.error(f"**Error invoking Nemotron Nano/Super:** {str(e)}")
+        for rec in approved_records:
+            short_id = rec.id[:8]
 
-        # 4. Memory extraction: run silently after each user turn.
-        #    Failures are intentionally swallowed -- this step must never
-        #    disrupt the chat experience.
-        try:
-            mem_record = extract_and_store_pending(
-                user_message=prompt,
-                source_turn_id=turn_id,
-                api_key=api_key,
-                storage=_store,
-            )
-            if mem_record:
-                logger.info(
-                    "[MemoryExtraction] Stored pending record %s for session %s",
-                    mem_record.id,
-                    session_id,
+            # Track whether this record is currently in edit mode.
+            edit_key = f"editing_{rec.id}"
+            if edit_key not in st.session_state:
+                st.session_state[edit_key] = False
+
+            with st.container(border=True):
+                # Header row: timestamp + id
+                st.caption(
+                    f"🕐 {rec.timestamp.strftime('%Y-%m-%d %H:%M UTC')}  ·  "
+                    f"ID: `{short_id}…`"
                 )
-        except Exception as _mem_exc:  # noqa: BLE001
-            logger.warning(
-                "[MemoryExtraction] Extraction step failed (non-fatal): %s", _mem_exc
-            )
+
+                # ---------------------------------------------------------
+                # VIEW MODE
+                # ---------------------------------------------------------
+                if not st.session_state[edit_key]:
+                    st.markdown(rec.content)
+
+                    col_edit_btn, col_del_btn = st.columns(2)
+                    with col_edit_btn:
+                        if st.button(
+                            "✏️ Edit",
+                            key=f"edit_start_{rec.id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[edit_key] = True
+                            # Seed the draft with the current content
+                            st.session_state[f"draft_{rec.id}"] = rec.content
+                            st.rerun()
+
+                    with col_del_btn:
+                        # Two-step delete: first press arms the confirm prompt,
+                        # second press executes the hard delete from storage.
+                        confirm_key = f"confirm_delete_{rec.id}"
+                        if confirm_key not in st.session_state:
+                            st.session_state[confirm_key] = False
+
+                        if not st.session_state[confirm_key]:
+                            if st.button(
+                                "🗑️ Delete",
+                                key=f"del_{rec.id}",
+                                use_container_width=True,
+                            ):
+                                st.session_state[confirm_key] = True
+                                st.rerun()
+                        else:
+                            # Armed state — show confirm/cancel
+                            st.warning("Permanently delete this record from storage?")
+                            col_yes, col_no = st.columns(2)
+                            with col_yes:
+                                if st.button(
+                                    "✅ Confirm Delete",
+                                    key=f"del_confirm_{rec.id}",
+                                    use_container_width=True,
+                                    type="primary",
+                                ):
+                                    deleted = _store.delete(rec.id)
+                                    if deleted:
+                                        st.success(
+                                            f"Record `{short_id}…` permanently deleted from storage."
+                                        )
+                                        logger.info(
+                                            "[Timeline] Hard-deleted record %s from storage.",
+                                            rec.id,
+                                        )
+                                    else:
+                                        st.error(
+                                            f"Delete failed: record `{short_id}…` not found in storage."
+                                        )
+                                    # Clean up confirm state and refresh
+                                    del st.session_state[confirm_key]
+                                    st.rerun()
+                            with col_no:
+                                if st.button(
+                                    "↩️ Cancel",
+                                    key=f"del_cancel_{rec.id}",
+                                    use_container_width=True,
+                                ):
+                                    st.session_state[confirm_key] = False
+                                    st.rerun()
+
+                # ---------------------------------------------------------
+                # EDIT MODE
+                # ---------------------------------------------------------
+                else:
+                    draft_key = f"draft_{rec.id}"
+                    new_content = st.text_area(
+                        "Edit memory content",
+                        value=st.session_state.get(draft_key, rec.content),
+                        key=f"textarea_{rec.id}",
+                        height=100,
+                        label_visibility="collapsed",
+                    )
+                    # Keep draft in sync
+                    st.session_state[draft_key] = new_content
+
+                    col_save, col_cancel = st.columns(2)
+                    with col_save:
+                        if st.button(
+                            "💾 Save",
+                            key=f"save_{rec.id}",
+                            use_container_width=True,
+                            type="primary",
+                        ):
+                            stripped = new_content.strip()
+                            if not stripped:
+                                st.error("Content cannot be empty.")
+                            else:
+                                updated = _store.update(rec.id, content=stripped)
+                                if updated:
+                                    st.success("Memory updated in storage.")
+                                    logger.info(
+                                        "[Timeline] Updated record %s content in storage.",
+                                        rec.id,
+                                    )
+                                else:
+                                    st.error(
+                                        f"Update failed: record `{short_id}…` not found in storage."
+                                    )
+                                # Exit edit mode and refresh
+                                st.session_state[edit_key] = False
+                                if draft_key in st.session_state:
+                                    del st.session_state[draft_key]
+                                st.rerun()
+
+                    with col_cancel:
+                        if st.button(
+                            "↩️ Cancel",
+                            key=f"cancel_{rec.id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[edit_key] = False
+                            if draft_key in st.session_state:
+                                del st.session_state[draft_key]
+                            st.rerun()
